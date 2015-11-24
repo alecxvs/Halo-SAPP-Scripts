@@ -11,7 +11,7 @@
       Credits:
         Structure based on: Time Remaining by 002
         Coordinate and rotation logic from: Object Tag Info Utility by H® Shaft
-        Json parsing is handled by: JSON by Jeffrey Friedl
+        Json parsing is handled by: JSON by Jeffrey Friedl (http://regex.info/code/JSON.lua)
           + The JSON.lua file for this should be distributed with this script
               and installed in sapp/lua as well.
 ]]--
@@ -22,12 +22,12 @@ api_version = "1.9.0.0"
 ADMIN_LEVEL = 4
 ADD_SPAWN_SYNTAX = "Syntax: +spawn (@<player_index>) <vehicle> ((~)<gametype>)"
 VEHICLES = {
-  ghost = "",
-  banshee = "",
-  scorpion = "",
-  warthog = "",
-  rwarthog = "",
-  turret = ""
+  ghost = "vehicles\\ghost\\ghost_mp",
+  banshee = "vehicles\\banshee\\banshee_mp",
+  scorpion = "vehicles\\scorpion\\scorpion_mp",
+  warthog = "vehicles\\warthog\\mp_warthog",
+  rwarthog = "vehicles\\rwarthog\\rwarthog",
+  turret = "vehicles\\c gun turret\\c gun turret_mp"
 }
 
 GAMETYPES = {
@@ -40,53 +40,89 @@ GAMETYPES = {
 
 SCHEMA_VERSION = 1
 
+local game_started = false
+local spawned_vehicles = {}
 
-function OnScriptLoad() register_callback(cb['EVENT_COMMAND'],"OnCommand") end
+function OnScriptLoad()
+  register_callback(cb['EVENT_COMMAND'], "OnCommand")
+  register_callback(cb['EVENT_GAME_START'], "OnNewGame")
+  Commander:RegisterCommand("+spawn", Command_AddSpawn)
+
+  if get_var(0, "$gt") ~= "n/a" then
+		game_started = true
+	end
+end
 function OnScriptUnload() end
 
--- Print to rcon given a player, or else print to console.
-function rcprint(ply_index, message)
-  if ply_index then
-    rprint(ply_index, message)
+function OnNewGame()
+  game_started = true
+  local map_name = get_var(0, "$map")
+  local gametype = get_var(0, "$gt")
+  local variant = get_var(0, "$mode")
+
+  local status, vehicle_spawns = ReadVehicleSpawns()
+
+  --Spawn all the vehicles!
+  if status and vehicle_spawns[map_name] then
+    local default_spawns = vehicle_spawns[map_name].default or {}
+    local gametype_spawns = vehicle_spawns[map_name].gametypes[gametype] or {}
+    local variant_spawns = vehicle_spawns[map_name].variants[variant] or {}
+    local tags_used = {}
+
+    for _, spawnlist in ipairs({variant_spawns, gametype_spawns, default_spawns}) do
+      for tag, spawns in pairs(spawnlist) do
+        if not tags_used[tag] then
+          tags_used[tag] = true
+          for i, spawn in ipairs(spawns) do
+            table.insert(spawned_vehicles, spawn_object("vehi", tag, spawn.x, spawn.y, spawn.z, spawn.rot))
+          end
+        end
+      end
+    end
+  end
+end
+
+function OnCommand(a, b, c, d)
+  return Commander:OnCommand(a, b, c, d)
+end
+
+function SyntaxError(msg)
+  return msg and {msg, ADD_SPAWN_SYNTAX} or ADD_SPAWN_SYNTAX
+end
+
+function ReadVehicleSpawns()
+  cprint("Reading vehicles.json...")
+  local status, output = false, {}
+  local vehi_file, err = io.open("vehicles.json", "r")
+  local vehicle_spawns = {}
+  if vehi_file then
+    status, output = pcall(function() return JSON:decode(vehi_file:read("*a")) end)
+    vehi_file:close()
   else
-    cprint(message)
+    local newfile = io.open("vehicles.json", "w")
+    newfile:close()
+    return true, {}
   end
+  return status, err or output or {}
 end
 
-function ReplyFunction( environment )
-  return (environment == 2 and say) or  -- If executed by player in chat, use say
-         (rcprint)                      -- Else, use rcprint to handle rcon/console
+function WriteVehicleSpawns(vehicle_spawns)
+  cprint("Writing vehicles.json...")
+  vehi_file = io.open("vehicles.json", "w")
+  vehi_file:write(JSON:encode_pretty(vehicle_spawns))
+  vehi_file:close()
 end
 
-function CheckCommand(cmd)
-  if cmd == "+spawn" then return end
-  return true
-end
-
-function ValidateGametype(gametype)
-  for k,_ in pairs(GAMETYPES) do
-    if k == gametype then return true end
+function ParseGametype(name)
+  if string.sub(name, 1, 1) == "~" then
+    gametype = string.sub(name, 2, #name)
+    for k,_ in pairs(GAMETYPES) do
+      if k == gametype then return "gametype", gametype end
+    end
+    return "gametype", false
   end
-  return false
+  return "variant", name
 end
-
-function ValidateVehicle(vehicle)
-  for k,_ in pairs(VEHICLES) do
-    if k == vehicle then return true end
-  end
-  return false
-end
-
-function OnCommand( ply_index, msg, env, rcon_pwd )
-  local command = false
-  local args = {}
-  for str in string.gmatch(msg, "%S+") do
-    if      command           then table.insert(args, str)
-    elseif  CheckCommand(str) then return
-    else    command = str     end
-  end
-
-  reply = ReplyFunction(env)
 
 --[[
     Command: +spawn
@@ -105,145 +141,109 @@ function OnCommand( ply_index, msg, env, rcon_pwd )
           Syntax: Specific name of gametype, or ~<gametype> for general types, or "any" (example: "my_fun_slayer" or "~slayer")
 
 ]]--
-
-  if command == "+spawn" then
-    if ply_index and tonumber(get_var(ply_index, "$lvl")) < ADMIN_LEVEL then
-        reply(ply_index, "Insufficient permission to create spawns")
-        return false
-    end
-
-    local target_index = 0
-    local vehicle = ""
-    local gametype = "any"
-    local variant = false
-
-    --Get target_index if specified (and then remove it from args)
-    if args[1] then
-      if string.sub(args[1], 1, 1) == "@" then
-        target_index = tonumber(string.gsub(table.remove(args, 1), "%d+"))
-        if not target_index then
-          reply(ply_index, "Invalid target_index, did not resolve to a player index.")
-          reply(ply_index, ADD_SPAWN_SYNTAX)
-          return false
-        end
-      else
-        if ply_index then
-          target_index = ply_index
-        else
-          reply(ply_index, "You must specify a target index!")
-          reply(ply_index, ADD_SPAWN_SYNTAX)
-          return false
-        end
-      end
-    else
-      reply(ply_index, ADD_SPAWN_SYNTAX)
-      return false
-    end
-
-    --Get vehicle name
-    if args[1] then
-      vehicle = args[1]
-      if not ValidateVehicle(vehicle) then
-        reply(ply_index, "Unknown vehicle. Valid options are: ghost, scorpion, banshee, warthog, rwarthog, turret")
-        reply(ply_index, ADD_SPAWN_SYNTAX)
-        return false
-      end
-    else
-      reply(ply_index, "You must specify a vehicle name!")
-      reply(ply_index, ADD_SPAWN_SYNTAX)
-      return false
-    end
-
-    --Get gametype if specified
-    if args[2] then
-      if string.sub(args[2], 1, 1) == "~" then
-        gametype = string.sub(args[2], 2, #args[2])
-
-        if not ValidateGametype(gametype) then
-          reply(ply_index, "Invalid gametype. Valid options are: slayer, oddball, king, ctf, race")
-          reply(ply_index, ADD_SPAWN_SYNTAX)
-          return false
-        end
-      else
-        variant = args[2]
-      end
-    end
-
-    cprint("Reading vehicles.json...")
-    local vehi_file, err = io.open("vehicles.json", "r")
-    local vehicle_spawns = {}
-    if vehi_file then
-      local vehi_json = vehi_file:read("*a")
-      local status, output = pcall(function() return JSON:decode(vehi_json) end)
-      if status then
-        vehicle_spawns = output or {}
-      else
-        reply(ply_index, "WARNING: Could not parse vehicles.json. Malformed JSON?")
-        reply(ply_index, "JSON Error: " .. output)
-        if vehi_json then
-          reply(ply_index, "The existing vehicles.json is being backed up and a new one will be created.")
-          local backup = assert(io.open("vehicles.json.backup", "w"))
-          backup:write(vehi_json)
-          backup:close()
-        end
-      end
-      vehi_file:close()
-    end
-
-
-    --version = vehicle_spawns["schema_version"] or vehicle_spawns["schema_version"] = SCHEMA_VERSION
-
-    -- local target_index = 0
-    -- local vehicle = ""
-    -- local gametype = "any"
-    -- local variant = ""
-    local player_object = get_dynamic_player(target_index)
-    local player_static = get_player(target_index)
-    local x, y, z = read_vector3d(player_object + 0x5C)
-    local rotation = read_float(player_static + 0x138)
-    local map_name = get_var(0,"$map")
-
-    if not vehicle_spawns[map_name] then vehicle_spawns[map_name] = {} end
-    if not vehicle_spawns[map_name][vehicle] then vehicle_spawns[map_name][vehicle] = {} end
-
-    local vehi_spawn = {
-      x = x,
-      y = y,
-      z = z,
-      rot = rotation
-    }
-
-    local gametypes_allowed = {}
-    local variants_allowed = {}
-
-    if gametype == "any" then
-      gametypes_allowed = GAMETYPES
-    elseif string.sub(gametype, 1, 1) == "~" then
-      gametypes_allowed = {string.sub(gametype, 2, #gametype)}
-    end
-
-    if variant then
-      variants_allowed = {gametype}
-    end
-
-    vehi_spawn["gametypes_allowed"] = gametypes_allowed
-    vehi_spawn["variants_allowed"] = variants_allowed
-
-    table.insert(vehicle_spawns[map_name][vehicle], vehi_spawn)
-
-    cprint("Writing vehicles.json...")
-    vehi_file = io.open("vehicles.json", "w")
-    vehi_file:write(JSON:encode_pretty(vehicle_spawns))
-    reply(ply_index, "Added new vehicle spawn for "..vehicle.." on "..map_name.."!")
-    reply(ply_index, "X: " .. x .. " Y: " .. y .. " Z: " .. z .. " R: " .. rotation)
-    vehi_file:close()
-    cprint("Added new vehicle spawn:")
-    cprint(JSON:encode_pretty(vehi_spawn))
-  else
-    return
+function Command_AddSpawn( ply_index, cmd, args )
+  if ply_index and ply_index ~= 0 and tonumber(get_var(ply_index, "$lvl")) < ADMIN_LEVEL then
+      return "Insufficient permission to create spawns"
   end
 
-  return false
+  local target_index = 0
+  local vehicle = ""
+  local gametype = "any"
+  local variant = false
+
+  --Get target_index if specified (and then remove it from args)
+  if args[1] then
+    if string.sub(args[1], 1, 1) == "@" then
+      local str_target_index = string.gsub(table.remove(args, 1), "@(%d+)", "%1")
+      target_index = tonumber(str_target_index)
+      if not target_index then
+        return SyntaxError("Invalid target_index, did not resolve to a player index.")
+      end
+    else
+      if ply_index ~= 0 then target_index = ply_index
+      else return SyntaxError("You must specify a target index!") end
+    end
+  else return SyntaxError() end
+
+  --Get vehicle name
+  if args[1] then
+    vehicle = VEHICLES[args[1]]
+    if not vehicle then
+      return SyntaxError("Unknown vehicle. Valid options are: ghost, scorpion, banshee, warthog, rwarthog, turret")
+    end
+  else return SyntaxError("You must specify a vehicle name!") end
+
+  --Get gametype if specified
+  if args[2] then
+    local type, result = ParseGametype(args[2])
+    if type == "variant" then variant = result elseif result then gametype = result
+    else return SyntaxError("Invalid gametype. Valid options are: slayer, oddball, king, ctf, race") end
+  end
+
+  --version = vehicle_spawns["schema_version"] or vehicle_spawns["schema_version"] = SCHEMA_VERSION
+
+  local player_object = get_dynamic_player(target_index)
+  local player_static = get_player(target_index)
+  local x, y, z = read_vector3d(player_object + 0x5C)
+  local rotation = read_float(player_static + 0x138)
+  local map_name = get_var(0, "$map")
+
+  local status, vehicle_spawns = ReadVehicleSpawns()
+
+  if not status then
+    if type(vehicle_spawns) == "table" then
+      if vehi_json then
+        local backup = assert(io.open("vehicles.json.backup", "w"))
+        backup:write(vehi_json)
+        backup:close()
+      end
+    else
+      return "An error has occurred in opening vehicles.json!"
+    end
+  end
+
+  if not vehicle_spawns[map_name] then
+    vehicle_spawns[map_name] = {
+      default = {},
+      gametypes = {
+        slayer = {},
+        ctf = {},
+        oddball = {},
+        king = {},
+        race = {}
+      },
+      variants = {}
+    }
+  end
+
+  local context = variant and vehicle_spawns[map_name].variants[variant] or
+                  gametype ~= "any" and vehicle_spawns[map_name].gametypes[gametype] or
+                  vehicle_spawns[map_name].default
+
+  if not context[vehicle] then context[vehicle] = {} end
+
+  local vehi_spawn = {
+    x = x,
+    y = y,
+    z = z,
+    rot = rotation
+  }
+  table.insert(context[vehicle], vehi_spawn)
+
+  WriteVehicleSpawns(vehicle_spawns)
+
+  cprint("Added new vehicle spawn:")
+  cprint(JSON:encode_pretty(vehi_spawn))
+
+  local new_vehicle = spawn_object("vehi", vehicle, x, y, z, rotation)
+  enter_vehicle(new_vehicle, target_index, 0)
+
+
+  return {
+    "Added new vehicle spawn for "..vehicle.." on "..map_name.."!",
+    "X: " .. x .. " Y: " .. y .. " Z: " .. z .. " R: " .. rotation
+  }
 end
 
 JSON = require "JSON"
+Commander = require "commander"
